@@ -6,9 +6,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/takama/daemon"
 	"github.com/vishvananda/netlink"
 	"gopkg.in/yaml.v3"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -22,6 +24,7 @@ import (
 
 func check(e error) {
 	if e != nil {
+		errlog.Println("Error: ", e)
 		panic(e)
 	}
 }
@@ -37,11 +40,13 @@ type Config struct {
 }
 
 func readConfig(file string) Config {
+	stdlog.Printf("Reading config file %v... ", file)
 	content, err := ioutil.ReadFile(file)
 	check(err)
 	config := Config{}
 	err = yaml.Unmarshal([]byte(content), &config)
 	check(err)
+	stdlog.Printf("Done!\n")
 	return config
 }
 
@@ -120,7 +125,7 @@ func watch(config Config, current *item, event chan []nic) {
 	defer (*current).mu.Unlock()
 	nics, err := getNics()
 	if err == nil && !isEqualNics((*current).val, nics) {
-		fmt.Printf("New private nics state: %v\n", nics)
+		stdlog.Printf("New private nics state: %v", nics)
 		event <- nics // send only if changed
 	}
 }
@@ -139,6 +144,7 @@ func updateNic(nic string, ip string) {
 	check(err)
 	err = netlink.AddrAdd(link, addr)
 	check(err)
+	stdlog.Printf("Added %v to %v", ip, nic)
 }
 
 func findNicIndex(ip net.IP) (int, error) {
@@ -160,8 +166,14 @@ func findNicIndex(ip net.IP) (int, error) {
 }
 
 func updateRoute(dest string, gw string) {
-	_, dst, err := net.ParseCIDR(dest)
-	check(err)
+	var dst *net.IPNet
+	if dest != "default" {
+		_, parsed, err := net.ParseCIDR(dest)
+		check(err)
+		dst = parsed
+	} else {
+		dst = nil
+	}
 	ip := net.ParseIP(gw)
 	linkIndex, err := findNicIndex(ip)
 	if err == nil {
@@ -172,6 +184,7 @@ func updateRoute(dest string, gw string) {
 		route := netlink.Route{LinkIndex: linkIndex, Dst: dst, Gw: ip}
 		err = netlink.RouteAppend(&route)
 		check(err)
+		stdlog.Printf("Added route %v via %v", dest, gw)
 	}
 }
 
@@ -186,7 +199,7 @@ func update(config Config, current *item, event chan []nic) {
 		if bytes.Compare(iface.HardwareAddr, nil) != 0 {
 			for _, nic := range value {
 				if strings.ToLower(nic.mac) == strings.ToLower(iface.HardwareAddr.String()) {
-					fmt.Printf("Found interface %v with mac address %v\n", iface.Name, nic.mac)
+					stdlog.Printf("Found interface %v with mac address %v", iface.Name, nic.mac)
 					for _, pn := range config.Pns {
 						if pn.Id == nic.id {
 							pns[iface.Name] = pn.Ip
@@ -222,13 +235,47 @@ func loop(f fn, s int, config Config, current *item, event chan []nic) {
 
 var (
 	pool = flag.Int("p", 10, "pooling time")
-	conf = flag.String("c", "pn.yaml", "config filename")
+	conf = flag.String("c", "/etc/scw-wau/pn.yaml", "config filename")
 )
 
-func main() {
-	flag.Parse()
+const (
+	name        = "scw-wau"
+	description = "Scaleway PN Watch and Update"
+)
+
+var dependencies = []string{}
+
+var stdlog, errlog *log.Logger
+
+type Service struct {
+	daemon.Daemon
+}
+
+func (service *Service) Manage() (string, error) {
+
+	usage := "Usage: scw-wau install | remove | start | stop | status"
+
+	// if received any kind of command, do it
+	if len(os.Args) > 1 {
+		command := os.Args[1]
+		switch command {
+		case "install":
+			return service.Install()
+		case "remove":
+			return service.Remove()
+		case "start":
+			return service.Start()
+		case "stop":
+			return service.Stop()
+		case "status":
+			return service.Status()
+		default:
+		        flag.Parse()
+		}
+	}
+
 	config := readConfig(*conf)
-	fmt.Printf("Starting pooling every %v seconds\n", *pool)
+	stdlog.Printf("Starting pooling every %v seconds", *pool)
 
 	curr := item{val: []nic{}}
 	ev := make(chan []nic)
@@ -236,7 +283,28 @@ func main() {
 	go loop(update, 0, config, &curr, ev)
 
 	sig := make(chan os.Signal)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
 	s := <-sig
-	fmt.Printf("\nSignal (%v) received, stopping\n", s)
+	stdlog.Printf("Signal (%v) received, stopping", s)
+
+	return usage, nil
+}
+
+func init() {
+	stdlog = log.New(os.Stdout, "", log.Ldate|log.Ltime)
+	errlog = log.New(os.Stderr, "", log.Ldate|log.Ltime)
+}
+
+func main() {
+	srv, err := daemon.New(name, description, daemon.SystemDaemon, dependencies...)
+	if err != nil {
+		errlog.Println("Error: ", err)
+		os.Exit(1)
+	}
+	service := &Service{srv}
+	status, err := service.Manage()
+	if err != nil {
+		errlog.Println(status, "- Error: ", err)
+		os.Exit(1)
+	}
 }
