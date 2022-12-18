@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/creasty/defaults"
 	"github.com/takama/daemon"
 	"github.com/vishvananda/netlink"
 	"gopkg.in/yaml.v3"
@@ -14,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"regexp"
 	"strings"
@@ -29,14 +31,52 @@ func check(e error) {
 	}
 }
 
+func runCmd(command string) (string, string, error) {
+	shell, ok := os.LookupEnv("SHELL")
+	if !ok {
+		shell = "sh"
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd := exec.Command(shell, "-c", command)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	return stdout.String(), stderr.String(), err
+}
+
+func runCmds(commands []string) {
+	for _, cmd := range commands {
+		stdout, stderr, err := runCmd(cmd)
+		if err == nil {
+			stdlog.Printf("Run '%v' with success", cmd)
+		} else {
+			errlog.Printf("Error running '%v':\n- stdout: %v\n- stderr: %v", cmd, stdout, stderr)
+		}
+	}
+}
+
 type Pn struct {
 	Id string `yaml:"id"`
 	Ip string `yaml:"ip"`
+	Ex string `default:"" yaml:"ex"`
 }
 
 type Config struct {
 	Pns    []Pn     `yaml:"pns"`
 	Routes []string `yaml:"routes"`
+}
+
+// parse default values for Pn structure
+func (pn *Pn) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	defaults.Set(pn)
+	type plain Pn
+	if err := unmarshal((*plain)(pn)); err != nil {
+		return err
+	}
+	return nil
 }
 
 func readConfig(file string) Config {
@@ -195,23 +235,40 @@ func update(config Config, current *item, event chan []nic) {
 	ifaces, err := net.Interfaces()
 	check(err)
 	pns := make(map[string]string)
-	for _, iface := range ifaces {
-		if bytes.Compare(iface.HardwareAddr, nil) != 0 {
-			for _, nic := range value {
-				if strings.ToLower(nic.mac) == strings.ToLower(iface.HardwareAddr.String()) {
-					stdlog.Printf("Found interface %v with mac address %v", iface.Name, nic.mac)
-					for _, pn := range config.Pns {
-						if pn.Id == nic.id {
-							pns[iface.Name] = pn.Ip
+	found := make(map[string]string)
+	var cmds []string
+	for retry := 0; retry < 3; retry++ { // metadata may be up to date before nics appears in the system
+		for _, iface := range ifaces {
+			if bytes.Compare(iface.HardwareAddr, nil) != 0 {
+				for _, nic := range value {
+					if strings.ToLower(nic.mac) == strings.ToLower(iface.HardwareAddr.String()) {
+						stdlog.Printf("Found interface %v with mac address %v", iface.Name, nic.mac)
+						found[iface.Name] = nic.mac
+						for _, pn := range config.Pns {
+							if pn.Id == nic.id {
+								stdlog.Printf("Associated config exists for %v (%v)", iface.Name, pn.Ip)
+								pns[iface.Name] = pn.Ip
+								if pn.Ex != "" {
+									cmds = append(cmds, pn.Ex)
+								}
+							}
 						}
 					}
 				}
 			}
 		}
+		if len(found) == len(value) { // all interfaces found, let's continue
+			break
+		} else {
+			stdlog.Println("Not all interfaces found, retrying...")
+			halfSecond, _ := time.ParseDuration("500ms")
+			time.Sleep(halfSecond)
+		}
 	}
 	for nic, ip := range pns {
 		updateNic(nic, ip)
 	}
+	runCmds(cmds)
 	routes := make(map[string]string)
 	r := regexp.MustCompile(`^(?P<Dest>default|[0-9\.\/]+)[ ]+via[ ]+(?P<Gw>[0-9\.]+)$`)
 	for _, route := range config.Routes {
@@ -253,7 +310,7 @@ type Service struct {
 
 func (service *Service) Manage() (string, error) {
 
-	usage := "Usage: scw-wau install | remove | start | stop | status"
+	usage := "Usage: scw-wau install | remove | start | stop | status | help"
 
 	// if received any kind of command, do it
 	if len(os.Args) > 1 {
@@ -269,8 +326,12 @@ func (service *Service) Manage() (string, error) {
 			return service.Stop()
 		case "status":
 			return service.Status()
+		case "help":
+			fmt.Println(usage)
+			os.Exit(0)
+			return "", nil
 		default:
-		        flag.Parse()
+			flag.Parse()
 		}
 	}
 
@@ -287,7 +348,7 @@ func (service *Service) Manage() (string, error) {
 	s := <-sig
 	stdlog.Printf("Signal (%v) received, stopping", s)
 
-	return usage, nil
+	return "", nil
 }
 
 func init() {
