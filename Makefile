@@ -9,6 +9,10 @@ install: build
 	cp scw-wau /usr/local/bin/
 	scw-wau install
 
+remove:
+	- scw-wau remove
+	- rm -rf /etc/scw-wau /usr/local/bin/scw-wau
+
 clean:
 	- go clean
 	- rm -f scw-wau

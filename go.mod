@@ -3,6 +3,7 @@ module scw-wau
 go 1.18
 
 require (
+	github.com/creasty/defaults v1.6.0
 	github.com/takama/daemon v1.0.0
 	github.com/vishvananda/netlink v1.2.1-beta.2.0.20221214185949-378a404a26f0
 	gopkg.in/yaml.v3 v3.0.1
